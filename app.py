@@ -138,7 +138,11 @@ sp500 = align_next_trading_day(sp500_raw, endowment["Date"]) if sp500_raw is not
 cpi = safe_fetch_cpi()
 if cpi is not None:
     endowment_cpi = cpi.reindex(endowment["Date"], method="ffill")
-    real_total = endowment["Total"] / (endowment_cpi / endowment_cpi.iloc[0])
+    if endowment_cpi.notna().any():
+        valid_cpi = endowment_cpi[endowment_cpi.notna()]
+        real_total = endowment.loc[valid_cpi.index, "Total"] / (valid_cpi / valid_cpi.iloc[0])
+    else:
+        real_total = None
 else:
     real_total = None
 
