@@ -143,7 +143,10 @@ else:
     real_total = None
 
 composition = endowment.melt(id_vars="Date", value_vars=asset_columns, var_name="Asset Class", value_name="Value")
-composition["Year"] = composition["Date"].dt.year
+composition["QuarterLabel"] = composition["Date"].dt.to_period("Q").astype(str).str.replace("Q", " Q", regex=False)
+chart_data = (
+    composition.groupby(["Date", "QuarterLabel", "Asset Class"], as_index=False)["Value"].sum()
+)
 
 cumulative_endowment = endowment["Total"] / endowment["Total"].iloc[0] - 1
 cumulative_sp500 = sp500 / sp500.iloc[0] - 1 if sp500 is not None else None
@@ -151,16 +154,19 @@ cumulative_sp500 = sp500 / sp500.iloc[0] - 1 if sp500 is not None else None
 col_left, col_right = st.columns(2, gap="large")
 
 with col_left:
-    st.subheader("Asset Allocation by Year")
-    chart_data = composition.groupby(["Year", "Asset Class"], as_index=False)["Value"].sum()
+    st.subheader("Asset Allocation by Quarter")
     bar_chart = (
         alt.Chart(chart_data)
         .mark_bar()
         .encode(
-            x=alt.X("Year:O", title="Year"),
+            x=alt.X(
+                "QuarterLabel:O",
+                title="Quarter",
+                sort=alt.SortField("Date", order="ascending"),
+            ),
             y=alt.Y("Value:Q", title="Value"),
             color=alt.Color("Asset Class:N", legend=alt.Legend(title="Asset Class")),
-            tooltip=["Year:O", "Asset Class:N", "Value:Q"],
+            tooltip=["QuarterLabel:O", "Asset Class:N", "Value:Q"],
         )
         .properties(height=320)
     )
@@ -178,9 +184,13 @@ with col_right:
         st.caption("S&P 500 series is temporarily unavailable; showing endowment only.")
     line_chart = (
         alt.Chart(line_data.reset_index().melt("Date", var_name="Series", value_name="Return"))
-        .mark_line()
+        .mark_line(point=True)
         .encode(
-            x=alt.X("Date:T", title="Date"),
+            x=alt.X(
+                "Date:T",
+                title="Date",
+                axis=alt.Axis(format="%Y Q%q", labelAngle=-45),
+            ),
             y=alt.Y("Return:Q", title="Cumulative return"),
             color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
             tooltip=["Date:T", "Series:N", "Return:Q"],
