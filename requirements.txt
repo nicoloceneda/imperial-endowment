@@ -1,0 +1,8 @@
+pandas
+numpy
+openpyxl
+altair
+pandas_datareader
+requests
+streamlit
+packaging
