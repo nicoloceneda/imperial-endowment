@@ -1,11 +1,9 @@
 import re
-from io import StringIO
 
 import altair as alt
 import numpy as np
 import pandas as pd
 import pandas_datareader.data as web
-import requests
 import streamlit as st
 
 st.set_page_config(page_title="Imperial Endowment Dashboard", layout="wide")
@@ -39,22 +37,6 @@ def load_sp500(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
     return sp500["SP500"]
 
 
-@st.cache_data(show_spinner=False)
-def load_cpi_series() -> pd.Series:
-    url = "https://www.ons.gov.uk/generator?uri=/economy/inflationandpriceindices/timeseries/l522/mm23&format=csv"
-    response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-    response.raise_for_status()
-    lines = response.text.splitlines()
-    data_start = next(i for i, line in enumerate(lines) if re.match(r'"\d{4}(?: [A-Z]{3})?"', line))
-    data_lines = lines[data_start:]
-    data = pd.read_csv(StringIO("\n".join(data_lines)), header=None, names=["date", "cpi"])
-    data = data[data["date"].str.contains(r"^\d{4} [A-Z]{3}$", regex=True)]
-    data["date"] = pd.to_datetime(data["date"], format="%Y %b") + pd.offsets.MonthEnd(0)
-    data["cpi"] = pd.to_numeric(data["cpi"], errors="coerce")
-    data = data.dropna().set_index("date").sort_index()
-    return data["cpi"]
-
-
 def safe_fetch_sp500(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series | None:
     try:
         sp500 = load_sp500(start, end)
@@ -65,18 +47,6 @@ def safe_fetch_sp500(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series | None
         st.warning("S&P 500 data unavailable for the selected dates.")
         return None
     return sp500
-
-
-def safe_fetch_cpi() -> pd.Series | None:
-    try:
-        cpi = load_cpi_series()
-    except Exception as exc:  # noqa: BLE001
-        st.warning(f"Inflation data unavailable: {exc}")
-        return None
-    if cpi.empty:
-        st.warning("Inflation data unavailable for the selected dates.")
-        return None
-    return cpi
 
 
 def align_next_trading_day(series: pd.Series, dates: pd.Series) -> pd.Series:
@@ -122,8 +92,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Imperial College London Endowment Dashboard")
-st.caption("Composition and performance overview with inflation-adjusted metrics.")
+st.title("Imperial College Endowment")
+st.caption("Composition and performance overview.")
 
 endowment = load_endowment_data("data/data.xlsx")
 asset_columns = [col for col in endowment.columns if col != "Date"]
@@ -134,13 +104,6 @@ end_date = endowment["Date"].max() + pd.offsets.MonthEnd(1)
 
 sp500_raw = safe_fetch_sp500(start_date, end_date)
 sp500 = align_next_trading_day(sp500_raw, endowment["Date"]) if sp500_raw is not None else None
-
-cpi = safe_fetch_cpi()
-if cpi is not None:
-    endowment_cpi = cpi.reindex(endowment["Date"], method="ffill")
-    real_total = endowment["Total"] / (endowment_cpi / endowment_cpi.iloc[0])
-else:
-    real_total = None
 
 composition = endowment.melt(id_vars="Date", value_vars=asset_columns, var_name="Asset Class", value_name="Value")
 composition["QuarterLabel"] = composition["Date"].dt.to_period("Q").astype(str).str.replace("Q", " Q", regex=False)
@@ -154,7 +117,7 @@ cumulative_sp500 = sp500 / sp500.iloc[0] - 1 if sp500 is not None else None
 col_left, col_right = st.columns(2, gap="large")
 
 with col_left:
-    st.subheader("Asset Allocation by Quarter")
+    st.subheader("Asset Allocation")
     bar_chart = (
         alt.Chart(chart_data)
         .mark_bar()
@@ -173,7 +136,7 @@ with col_left:
     st.altair_chart(bar_chart, use_container_width=True)
 
 with col_right:
-    st.subheader("Cumulative Return: Endowment vs S&P 500")
+    st.subheader("Cumulative Return")
     line_data = pd.DataFrame(
         {"Endowment": cumulative_endowment.values},
         index=endowment["Date"],
@@ -201,15 +164,10 @@ with col_right:
 
 st.subheader("Performance Metrics")
 nominal_metrics = performance_metrics(endowment["Total"])
-if real_total is not None:
-    real_metrics = performance_metrics(real_total)
-else:
-    real_metrics = {key: np.nan for key in nominal_metrics}
 
 metrics_df = pd.DataFrame(
     {
         "Nominal": nominal_metrics,
-        "Inflation-adjusted": real_metrics,
     }
 )
 
@@ -225,4 +183,4 @@ for metric, fmt in format_pct.items():
     metrics_display.loc[metric] = metrics_df.loc[metric].map(lambda x: "—" if pd.isna(x) else fmt.format(x))
 
 st.dataframe(metrics_display, width="stretch")
-st.caption("Sources: Imperial endowment data (internal), S&P 500 (FRED), CPIH (ONS).")
+st.caption("Sources: Imperial endowment data (internal), S&P 500 (FRED).")
