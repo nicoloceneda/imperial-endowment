@@ -19,6 +19,21 @@ SECTION_END_PATTERN = re.compile(
 )
 TOTAL_ROW_PATTERN = re.compile(r"Endowment\s+Total\s+([\d,\s]+|-)$", flags=re.IGNORECASE)
 ASSET_ROW_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z &/,\-]+?)\s+([\d,\s]+|-)\s*$")
+DIRECT_HOLDINGS_HEADER_PATTERN = re.compile(r"^\s*Direct Holdings\s+£", flags=re.MULTILINE)
+TOTAL_FUNDS_PATTERN = re.compile(r"^\s*.*Total\s+Funds\s+[\d,\s]+$", flags=re.MULTILINE)
+HOLDING_AMOUNT_PATTERN = re.compile(r"\d[\d\s]*,\d{3}(?:,\d{3})*")
+NAME_FRAGMENT_TOKENS = {
+    "A",
+    "PLC",
+    "PLC*",
+    "LTD",
+    "INC",
+    "COM",
+    "CO",
+    "CORP",
+    "NPV",
+    "ORD",
+}
 
 
 def normalize_pdf_text(text: str) -> str:
@@ -94,6 +109,97 @@ def parse_asset_class_section(text: str, pdf_name: str) -> dict:
     return {"Date": date_value, "Total": total_value, **assets}
 
 
+def clean_company_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip(" -")
+
+
+def is_incomplete_company_name(value: str) -> bool:
+    normalized = clean_company_name(value)
+    if not normalized:
+        return False
+    token = normalized.upper()
+    if token in NAME_FRAGMENT_TOKENS:
+        return True
+    return len(re.sub(r"[^A-Za-z]", "", token)) <= 3
+
+
+def parse_direct_holdings_section(text: str, pdf_name: str) -> list[dict]:
+    start_match = DIRECT_HOLDINGS_HEADER_PATTERN.search(text)
+    if start_match is None:
+        raise ValueError(f"{pdf_name}: could not find Direct Holdings table.")
+
+    section = text[start_match.end() :]
+    end_match = TOTAL_FUNDS_PATTERN.search(section)
+    if end_match is not None:
+        section = section[: end_match.start()]
+
+    records: list[dict] = []
+    pending_prefix = ""
+    unresolved_fragment_index: int | None = None
+
+    for raw_line in section.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("direct holdings"):
+            continue
+        if line.startswith("*"):
+            continue
+
+        amount_matches = list(HOLDING_AMOUNT_PATTERN.finditer(line))
+
+        if not amount_matches:
+            if unresolved_fragment_index is not None and re.search(r"[A-Za-z]", line):
+                joined = clean_company_name(f"{line} {records[unresolved_fragment_index]['Company']}")
+                records[unresolved_fragment_index]["Company"] = joined
+                unresolved_fragment_index = None
+                continue
+            if re.search(r"[A-Za-z]", line):
+                pending_prefix = clean_company_name(f"{pending_prefix} {line}")
+            continue
+
+        if len(amount_matches) == 1:
+            match = amount_matches[0]
+            company_name = clean_company_name(line[: match.start()])
+            if pending_prefix:
+                company_name = clean_company_name(f"{pending_prefix} {company_name}")
+                pending_prefix = ""
+            amount_value = parse_pdf_number(match.group())
+            if company_name:
+                records.append({"Company": company_name, "Amount": amount_value})
+                if is_incomplete_company_name(company_name):
+                    unresolved_fragment_index = len(records) - 1
+            trailing_text = clean_company_name(line[match.end() :])
+            if trailing_text and unresolved_fragment_index is not None:
+                joined = clean_company_name(f"{trailing_text} {records[unresolved_fragment_index]['Company']}")
+                records[unresolved_fragment_index]["Company"] = joined
+                unresolved_fragment_index = None
+            continue
+
+        left_match, right_match = amount_matches[0], amount_matches[1]
+
+        left_name = clean_company_name(line[: left_match.start()])
+        if pending_prefix:
+            left_name = clean_company_name(f"{pending_prefix} {left_name}")
+            pending_prefix = ""
+        right_name = clean_company_name(line[left_match.end() : right_match.start()])
+
+        if left_name:
+            left_amount = parse_pdf_number(left_match.group())
+            records.append({"Company": left_name, "Amount": left_amount})
+            if is_incomplete_company_name(left_name):
+                unresolved_fragment_index = len(records) - 1
+        if right_name:
+            right_amount = parse_pdf_number(right_match.group())
+            records.append({"Company": right_name, "Amount": right_amount})
+            if is_incomplete_company_name(right_name):
+                unresolved_fragment_index = len(records) - 1
+
+    if not records:
+        raise ValueError(f"{pdf_name}: no direct holdings rows were parsed.")
+    return records
+
+
 @st.cache_data(show_spinner=False)
 def load_endowment_data(pdf_dir: str) -> pd.DataFrame:
     pdf_paths = sorted(Path(pdf_dir).glob("*.pdf"))
@@ -118,6 +224,43 @@ def load_endowment_data(pdf_dir: str) -> pd.DataFrame:
     df[asset_columns] = df[asset_columns].fillna(0.0)
     df["Date"] = pd.to_datetime(df["Date"]).dt.to_period("M").dt.to_timestamp("M")
     return df
+
+
+@st.cache_data(show_spinner=False)
+def load_direct_holdings_data(pdf_dir: str) -> pd.DataFrame:
+    pdf_paths = sorted(Path(pdf_dir).glob("*.pdf"))
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in {pdf_dir}.")
+
+    rows = []
+    errors = []
+    for pdf_path in pdf_paths:
+        try:
+            text = extract_pdf_text(str(pdf_path))
+            statement_date = parse_asset_class_section(text, pdf_path.name)["Date"]
+            statement_label = statement_date.strftime("%b-%y")
+            holdings = parse_direct_holdings_section(text, pdf_path.name)
+            for row_order, holding in enumerate(holdings, start=1):
+                rows.append(
+                    {
+                        "StatementDate": statement_date,
+                        "Statement": statement_label,
+                        "StatementFile": pdf_path.name,
+                        "RowOrder": row_order,
+                        "Company": holding["Company"],
+                        "Amount": holding["Amount"],
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{pdf_path.name}: {exc}")
+
+    if errors:
+        error_preview = "; ".join(errors[:3])
+        raise RuntimeError(
+            f"Failed to parse direct holdings from one or more PDFs ({len(errors)} files). {error_preview}"
+        )
+
+    return pd.DataFrame(rows).sort_values(["StatementDate", "RowOrder"])
 
 
 @st.cache_data(show_spinner=False)
@@ -208,78 +351,112 @@ chart_data = (
 cumulative_endowment = endowment["Total"] / endowment["Total"].iloc[0] - 1
 cumulative_sp500 = sp500 / sp500.iloc[0] - 1 if sp500 is not None else None
 
-col_left, col_right = st.columns(2, gap="large")
+overview_tab, details_tab = st.tabs(["Overview", "Details"])
 
-with col_left:
-    st.subheader("Asset Allocation")
-    bar_chart = (
-        alt.Chart(chart_data)
-        .mark_bar()
-        .encode(
-            x=alt.X(
-                "QuarterLabel:O",
-                title="Quarter",
-                sort=alt.SortField("Date", order="ascending"),
-            ),
-            y=alt.Y("Value:Q", title="Value"),
-            color=alt.Color("Asset Class:N", legend=alt.Legend(title="Asset Class")),
-            tooltip=["QuarterLabel:O", "Asset Class:N", "Value:Q"],
-        )
-        .properties(height=320)
-    )
-    st.altair_chart(bar_chart, use_container_width=True)
+with overview_tab:
+    col_left, col_right = st.columns(2, gap="large")
 
-with col_right:
-    st.subheader("Cumulative Return")
-    line_data = pd.DataFrame(
-        {"Endowment": cumulative_endowment.values},
-        index=endowment["Date"],
-    )
-    if sp500 is not None:
-        line_data["S&P 500"] = cumulative_sp500.values
-    else:
-        st.caption("S&P 500 series is temporarily unavailable; showing endowment only.")
-    line_chart_data = line_data.reset_index().melt("Date", var_name="Series", value_name="Return")
-    line_chart = (
-        alt.Chart(line_chart_data)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X(
-                "Date:T",
-                title="Date",
-                axis=alt.Axis(
-                    format="%Y Q%q",
-                    labelAngle=-90,
-                    values=endowment["Date"].dt.to_pydatetime().tolist(),
+    with col_left:
+        st.subheader("Asset Allocation")
+        bar_chart = (
+            alt.Chart(chart_data)
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "QuarterLabel:O",
+                    title="Quarter",
+                    sort=alt.SortField("Date", order="ascending"),
                 ),
-            ),
-            y=alt.Y("Return:Q", title="Cumulative return"),
-            color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
-            tooltip=["Date:T", "Series:N", "Return:Q"],
+                y=alt.Y("Value:Q", title="Value"),
+                color=alt.Color("Asset Class:N", legend=alt.Legend(title="Asset Class")),
+                tooltip=["QuarterLabel:O", "Asset Class:N", "Value:Q"],
+            )
+            .properties(height=320)
         )
-        .properties(height=320)
+        st.altair_chart(bar_chart, use_container_width=True)
+
+    with col_right:
+        st.subheader("Cumulative Return")
+        line_data = pd.DataFrame(
+            {"Endowment": cumulative_endowment.values},
+            index=endowment["Date"],
+        )
+        if sp500 is not None:
+            line_data["S&P 500"] = cumulative_sp500.values
+        else:
+            st.caption("S&P 500 series is temporarily unavailable; showing endowment only.")
+        line_chart_data = line_data.reset_index().melt("Date", var_name="Series", value_name="Return")
+        line_chart = (
+            alt.Chart(line_chart_data)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X(
+                    "Date:T",
+                    title="Date",
+                    axis=alt.Axis(
+                        format="%Y Q%q",
+                        labelAngle=-90,
+                        values=endowment["Date"].dt.to_pydatetime().tolist(),
+                    ),
+                ),
+                y=alt.Y("Return:Q", title="Cumulative return"),
+                color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
+                tooltip=["Date:T", "Series:N", "Return:Q"],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(line_chart, use_container_width=True)
+
+    st.subheader("Performance Metrics")
+    nominal_metrics = performance_metrics(endowment["Total"])
+
+    metrics_df = pd.DataFrame(
+        {
+            "Nominal": nominal_metrics,
+        }
     )
-    st.altair_chart(line_chart, use_container_width=True)
 
-st.subheader("Performance Metrics")
-nominal_metrics = performance_metrics(endowment["Total"])
-
-metrics_df = pd.DataFrame(
-    {
-        "Nominal": nominal_metrics,
+    format_pct = {
+        "Average annual return": "{:.2%}",
+        "Annualized volatility": "{:.2%}",
+        "Sharpe ratio": "{:.2f}",
+        "Maximum drawdown": "{:.2%}",
     }
-)
 
-format_pct = {
-    "Average annual return": "{:.2%}",
-    "Annualized volatility": "{:.2%}",
-    "Sharpe ratio": "{:.2f}",
-    "Maximum drawdown": "{:.2%}",
-}
+    metrics_display = metrics_df.copy().astype(object)
+    for metric, fmt in format_pct.items():
+        metrics_display.loc[metric] = metrics_df.loc[metric].map(
+            lambda x: "—" if pd.isna(x) else fmt.format(x)
+        )
 
-metrics_display = metrics_df.copy().astype(object)
-for metric, fmt in format_pct.items():
-    metrics_display.loc[metric] = metrics_df.loc[metric].map(lambda x: "—" if pd.isna(x) else fmt.format(x))
+    st.dataframe(metrics_display, width="stretch")
+    st.caption("Sources: Imperial endowment quarterly PDF disclosures, S&P 500 (FRED).")
 
-st.dataframe(metrics_display, width="stretch")
-st.caption("Sources: Imperial endowment quarterly PDF disclosures, S&P 500 (FRED).")
+with details_tab:
+    st.subheader("Direct Holdings")
+    try:
+        direct_holdings = load_direct_holdings_data("data")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not load direct holdings from quarterly PDFs: {exc}")
+    else:
+        statements = (
+            direct_holdings[["StatementDate", "Statement", "StatementFile"]]
+            .drop_duplicates()
+            .sort_values("StatementDate", ascending=False)
+        )
+        selected_statement = st.selectbox(
+            "Statement",
+            statements["Statement"].tolist(),
+            index=0,
+        )
+        selected_metadata = statements[statements["Statement"] == selected_statement].iloc[0]
+        selected_holdings = direct_holdings[direct_holdings["Statement"] == selected_statement].sort_values(
+            "RowOrder"
+        )
+
+        holdings_display = selected_holdings[["Company", "Amount"]].copy()
+        holdings_display["Investment Amount (£)"] = holdings_display["Amount"].map(lambda value: f"{value:,.0f}")
+        holdings_display = holdings_display.drop(columns=["Amount"])
+
+        st.dataframe(holdings_display, hide_index=True, width="stretch")
+        st.caption(f"Source statement: {selected_metadata['StatementFile']}")
