@@ -145,14 +145,19 @@ with col_right:
         line_data["S&P 500"] = cumulative_sp500.values
     else:
         st.caption("S&P 500 series is temporarily unavailable; showing endowment only.")
+    line_chart_data = line_data.reset_index().melt("Date", var_name="Series", value_name="Return")
     line_chart = (
-        alt.Chart(line_data.reset_index().melt("Date", var_name="Series", value_name="Return"))
+        alt.Chart(line_chart_data)
         .mark_line(point=True)
         .encode(
             x=alt.X(
                 "Date:T",
                 title="Date",
-                axis=alt.Axis(format="%Y Q%q", labelAngle=-45),
+                axis=alt.Axis(
+                    format="%Y Q%q",
+                    labelAngle=-90,
+                    values=endowment["Date"].dt.to_pydatetime().tolist(),
+                ),
             ),
             y=alt.Y("Return:Q", title="Cumulative return"),
             color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
