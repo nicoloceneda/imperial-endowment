@@ -450,13 +450,56 @@ with details_tab:
             index=0,
         )
         selected_metadata = statements[statements["Statement"] == selected_statement].iloc[0]
-        selected_holdings = direct_holdings[direct_holdings["Statement"] == selected_statement].sort_values(
-            "RowOrder"
+        selected_holdings = (
+            direct_holdings[direct_holdings["Statement"] == selected_statement]
+            .assign(
+                _cash_first=lambda df: df["Company"].str.strip().str.upper().ne("CASH").astype(int),
+                _company_sort=lambda df: df["Company"].str.upper(),
+            )
+            .sort_values(by=["_cash_first", "_company_sort", "RowOrder"])
+            .drop(columns=["_cash_first", "_company_sort"])
         )
 
-        holdings_display = selected_holdings[["Company", "Amount"]].copy()
-        holdings_display["Investment Amount (£)"] = holdings_display["Amount"].map(lambda value: f"{value:,.0f}")
-        holdings_display = holdings_display.drop(columns=["Amount"])
+        sort_option = st.radio(
+            "Sort holdings by",
+            ["Name (A-Z)", "Amount (High-Low)"],
+            horizontal=True,
+        )
 
-        st.dataframe(holdings_display, hide_index=True, width="stretch")
+        cash_rows = selected_holdings[selected_holdings["Company"].str.strip().str.upper() == "CASH"]
+        non_cash_rows = selected_holdings[selected_holdings["Company"].str.strip().str.upper() != "CASH"]
+
+        if sort_option == "Name (A-Z)":
+            non_cash_rows = non_cash_rows.sort_values(
+                by=["Company", "RowOrder"],
+                key=lambda column: column.str.upper() if column.name == "Company" else column,
+            )
+        else:
+            non_cash_rows = non_cash_rows.sort_values(by=["Amount", "Company"], ascending=[False, True])
+
+        holdings_display = pd.concat([cash_rows, non_cash_rows], ignore_index=True)
+        holdings_table = holdings_display[["Company", "Amount"]].copy()
+        holdings_table["Investment Amount (£)"] = holdings_table["Amount"].map(lambda value: f"{value:,.0f}")
+        holdings_table = holdings_table.drop(columns=["Amount"])
+
+        st.table(holdings_table)
+
+        st.subheader("Capital Allocation Across Direct Holdings")
+        holdings_chart_data = holdings_display[["Company", "Amount"]].copy()
+        holdings_chart_data["IsCash"] = holdings_chart_data["Company"].str.strip().str.upper().eq("CASH")
+        holdings_chart = (
+            alt.Chart(holdings_chart_data)
+            .mark_bar()
+            .encode(
+                x=alt.X("Amount:Q", title="Investment Amount (£)", axis=alt.Axis(format=",.0f")),
+                y=alt.Y("Company:N", sort="-x", title="Holding"),
+                color=alt.condition(alt.datum.IsCash, alt.value("#2a9d8f"), alt.value("#4e79a7")),
+                tooltip=[
+                    "Company:N",
+                    alt.Tooltip("Amount:Q", title="Investment Amount (£)", format=",.0f"),
+                ],
+            )
+            .properties(height=max(320, len(holdings_chart_data) * 16))
+        )
+        st.altair_chart(holdings_chart, use_container_width=True)
         st.caption(f"Source statement: {selected_metadata['StatementFile']}")
