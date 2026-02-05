@@ -1,4 +1,7 @@
 import re
+import shutil
+import subprocess
+from pathlib import Path
 
 import altair as alt
 import numpy as np
@@ -8,25 +11,112 @@ import streamlit as st
 
 st.set_page_config(page_title="Imperial Endowment Dashboard", layout="wide")
 
+ASSET_CLASS_HEADING_PATTERN = re.compile(r"Breakdown\s+by\s+asset\s+class", flags=re.IGNORECASE)
+DATE_TAG_PATTERN = re.compile(r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2}")
+SECTION_END_PATTERN = re.compile(
+    r"\n\s*Direct Holdings, Collective Investment Vehicles, Property",
+    flags=re.IGNORECASE,
+)
+TOTAL_ROW_PATTERN = re.compile(r"Endowment\s+Total\s+([\d,\s]+|-)$", flags=re.IGNORECASE)
+ASSET_ROW_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z &/,\-]+?)\s+([\d,\s]+|-)\s*$")
+
+
+def normalize_pdf_text(text: str) -> str:
+    for symbol in ("\u00a0", "\u2007", "\u202f"):
+        text = text.replace(symbol, " ")
+    for symbol in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"):
+        text = text.replace(symbol, "-")
+    return text
+
+
+def parse_pdf_number(value: str) -> float:
+    value = value.strip()
+    if value in {"", "-"}:
+        return 0.0
+    cleaned = re.sub(r"[^\d,\s]", "", value).replace(" ", "")
+    if not cleaned:
+        raise ValueError(f"Unable to parse numeric value from: {value!r}")
+    return float(cleaned.replace(",", ""))
+
 
 @st.cache_data(show_spinner=False)
-def load_endowment_data(path: str) -> pd.DataFrame:
-    df = pd.read_excel(path)
-    df.columns = [col.strip() for col in df.columns]
+def extract_pdf_text(pdf_path: str) -> str:
+    gs_path = shutil.which("gs")
+    if gs_path is None:
+        raise RuntimeError("Ghostscript (gs) is required to extract text from PDFs.")
+    result = subprocess.run(
+        [gs_path, "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=txtwrite", "-sOutputFile=-", pdf_path],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return normalize_pdf_text(result.stdout)
 
-    def parse_date(value: str) -> pd.Timestamp:
-        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
-        if pd.isna(parsed):
-            match = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", str(value))
-            if match:
-                month = int(match.group(2))
-                year = int(match.group(3))
-                parsed = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
-        return parsed
 
-    df["Date"] = df["Date"].apply(parse_date)
-    df = df.dropna(subset=["Date"]).sort_values("Date")
-    df["Date"] = df["Date"].dt.to_period("M").dt.to_timestamp("M")
+def parse_asset_class_section(text: str, pdf_name: str) -> dict:
+    heading = ASSET_CLASS_HEADING_PATTERN.search(text)
+    if heading is None:
+        raise ValueError(f"{pdf_name}: could not find 'Breakdown by asset class' section.")
+    section = text[heading.start() :]
+    section_end = SECTION_END_PATTERN.search(section)
+    if section_end is not None:
+        section = section[: section_end.start()]
+
+    date_match = DATE_TAG_PATTERN.search(section)
+    if date_match is None:
+        raise ValueError(f"{pdf_name}: could not find quarter tag in asset class section.")
+    date_value = pd.to_datetime(date_match.group(), format="%b-%y") + pd.offsets.MonthEnd(0)
+
+    assets: dict[str, float] = {}
+    total_value = None
+    for raw_line in section.splitlines():
+        line = raw_line.strip()
+        if not line or "£ 000s" in line:
+            continue
+        if ASSET_CLASS_HEADING_PATTERN.search(line):
+            continue
+
+        total_match = TOTAL_ROW_PATTERN.search(line)
+        if total_match:
+            total_value = parse_pdf_number(total_match.group(1))
+            continue
+
+        asset_match = ASSET_ROW_PATTERN.match(line)
+        if asset_match:
+            asset_name = re.sub(r"\s+", " ", asset_match.group(1)).strip()
+            assets[asset_name] = parse_pdf_number(asset_match.group(2))
+
+    if not assets:
+        raise ValueError(f"{pdf_name}: no asset class rows were parsed.")
+    if total_value is None:
+        total_value = float(sum(assets.values()))
+
+    return {"Date": date_value, "Total": total_value, **assets}
+
+
+@st.cache_data(show_spinner=False)
+def load_endowment_data(pdf_dir: str) -> pd.DataFrame:
+    pdf_paths = sorted(Path(pdf_dir).glob("*.pdf"))
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in {pdf_dir}.")
+
+    rows = []
+    errors = []
+    for pdf_path in pdf_paths:
+        try:
+            text = extract_pdf_text(str(pdf_path))
+            rows.append(parse_asset_class_section(text, pdf_path.name))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{pdf_path.name}: {exc}")
+
+    if errors:
+        error_preview = "; ".join(errors[:3])
+        raise RuntimeError(f"Failed to parse one or more PDFs ({len(errors)} files). {error_preview}")
+
+    df = pd.DataFrame(rows).sort_values("Date")
+    asset_columns = [column for column in df.columns if column not in {"Date", "Total"}]
+    df[asset_columns] = df[asset_columns].fillna(0.0)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.to_period("M").dt.to_timestamp("M")
     return df
 
 
@@ -95,9 +185,13 @@ st.markdown(
 st.title("Imperial College Endowment")
 st.caption("Composition and performance overview.")
 
-endowment = load_endowment_data("data/data.xlsx")
-asset_columns = [col for col in endowment.columns if col != "Date"]
-endowment["Total"] = endowment[asset_columns].sum(axis=1)
+try:
+    endowment = load_endowment_data("data")
+except Exception as exc:  # noqa: BLE001
+    st.error(f"Could not load endowment data from quarterly PDFs: {exc}")
+    st.stop()
+
+asset_columns = [col for col in endowment.columns if col not in {"Date", "Total"}]
 
 start_date = endowment["Date"].min() - pd.offsets.MonthBegin(1)
 end_date = endowment["Date"].max() + pd.offsets.MonthEnd(1)
@@ -188,4 +282,4 @@ for metric, fmt in format_pct.items():
     metrics_display.loc[metric] = metrics_df.loc[metric].map(lambda x: "—" if pd.isna(x) else fmt.format(x))
 
 st.dataframe(metrics_display, width="stretch")
-st.caption("Sources: Imperial endowment data (internal), S&P 500 (FRED).")
+st.caption("Sources: Imperial endowment quarterly PDF disclosures, S&P 500 (FRED).")
