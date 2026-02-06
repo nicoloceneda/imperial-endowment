@@ -34,6 +34,10 @@ DIRECT_PROPERTY_HEADER_PATTERN = re.compile(
     r"^\s*Direct Holdings in Property\b",
     flags=re.IGNORECASE | re.MULTILINE,
 )
+INDIRECT_HOLDINGS_COMPANIES_HEADER_PATTERN = re.compile(
+    r"^\s*Indirect Holdings in Companies\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
 COLLECTIVE_RANGE_PATTERN = re.compile(
     r"^\s*(<\s*£?\s*\d+(?:\.\d+)?m|£?\s*\d+(?:\.\d+)?m\s*<\s*£?\s*\d+(?:\.\d+)?m)\s*(.*)$",
     flags=re.IGNORECASE,
@@ -315,6 +319,85 @@ def parse_collective_holdings_section(text: str, pdf_name: str) -> list[dict]:
     return records
 
 
+def parse_indirect_holdings_companies_section(text: str, pdf_name: str) -> list[str]:
+    start_match = INDIRECT_HOLDINGS_COMPANIES_HEADER_PATTERN.search(text)
+    if start_match is None:
+        raise ValueError(f"{pdf_name}: could not find 'Indirect Holdings in Companies' section.")
+
+    section = text[start_match.end() :]
+    parsed_rows: list[tuple[str, str]] = []
+    baseline_indent: int | None = None
+
+    for raw_line in section.splitlines():
+        leading_spaces = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        lowered = line.lower()
+        if lowered.startswith("indirect holdings in companies"):
+            continue
+        if lowered.startswith("please refer"):
+            continue
+        if line.startswith("http://") or line.startswith("https://"):
+            continue
+        if line.startswith("*"):
+            continue
+        if not re.search(r"[A-Za-z]", line):
+            continue
+
+        entries = [clean_company_name(part) for part in re.split(r"\s{2,}", line) if clean_company_name(part)]
+        if not entries:
+            continue
+
+        left_entry = entries[0]
+        right_entry = entries[1] if len(entries) > 1 else ""
+        if len(entries) > 2:
+            right_entry = clean_company_name(" ".join(entries[1:]))
+
+        if len(entries) > 1:
+            baseline_indent = leading_spaces if baseline_indent is None else min(baseline_indent, leading_spaces)
+
+        # Handle wrapped left-column labels, e.g. "Inst Inv" on the next line.
+        words = re.findall(r"[A-Za-z]+", left_entry)
+        looks_like_wrapped_fragment = words and len(words) <= 3 and all(len(word) <= 4 for word in words)
+        if (
+            len(entries) > 1
+            and parsed_rows
+            and baseline_indent is not None
+            and baseline_indent + 3 <= leading_spaces <= baseline_indent + 8
+            and looks_like_wrapped_fragment
+        ):
+            prev_left, prev_right = parsed_rows[-1]
+            parsed_rows[-1] = (clean_company_name(f"{prev_left} {left_entry}"), prev_right)
+            left_entry = ""
+
+        parsed_rows.append((left_entry, right_entry))
+
+    companies: list[str] = []
+    for left_entry, right_entry in parsed_rows:
+        if left_entry:
+            companies.append(left_entry)
+        if right_entry:
+            companies.append(right_entry)
+
+    if not companies:
+        raise ValueError(f"{pdf_name}: no companies were parsed from indirect holdings in companies.")
+    return companies
+
+
+def build_two_column_company_table(companies: list[str]) -> pd.DataFrame:
+    rows: list[list[str]] = []
+    for index in range(0, len(companies), 2):
+        left_company = companies[index]
+        right_company = companies[index + 1] if index + 1 < len(companies) else ""
+        rows.append([left_company, right_company])
+
+    table = pd.DataFrame(rows, columns=["Company", "Company "])
+    table.index = range(1, len(table) * 2, 2)
+    return table
+
+
 @st.cache_data(show_spinner=False)
 def load_endowment_data(pdf_dir: str) -> pd.DataFrame:
     pdf_paths = sorted(Path(pdf_dir).glob("*.pdf"))
@@ -417,6 +500,42 @@ def load_collective_holdings_data(pdf_dir: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_indirect_holdings_data(pdf_dir: str) -> pd.DataFrame:
+    pdf_paths = sorted(Path(pdf_dir).glob("*.pdf"))
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in {pdf_dir}.")
+
+    rows = []
+    errors = []
+    for pdf_path in pdf_paths:
+        try:
+            text = extract_pdf_text(str(pdf_path))
+            statement_date = parse_asset_class_section(text, pdf_path.name)["Date"]
+            statement_label = statement_date.strftime("%b-%y")
+            companies = parse_indirect_holdings_companies_section(text, pdf_path.name)
+            for row_order, company in enumerate(companies, start=1):
+                rows.append(
+                    {
+                        "StatementDate": statement_date,
+                        "Statement": statement_label,
+                        "StatementFile": pdf_path.name,
+                        "RowOrder": row_order,
+                        "Company": company,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{pdf_path.name}: {exc}")
+
+    if errors:
+        error_preview = "; ".join(errors[:3])
+        raise RuntimeError(
+            f"Failed to parse indirect holdings from one or more PDFs ({len(errors)} files). {error_preview}"
+        )
+
+    return pd.DataFrame(rows).sort_values(["StatementDate", "RowOrder"])
+
+
+@st.cache_data(show_spinner=False)
 def load_sp500(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
     sp500 = web.DataReader("SP500", "fred", start, end)
     sp500 = sp500.dropna().sort_index()
@@ -504,7 +623,7 @@ chart_data = (
 cumulative_endowment = endowment["Total"] / endowment["Total"].iloc[0] - 1
 cumulative_sp500 = sp500 / sp500.iloc[0] - 1 if sp500 is not None else None
 
-overview_tab, details_tab = st.tabs(["Overview", "Direct Holdings"])
+overview_tab, direct_tab, indirect_tab = st.tabs(["Overview", "Direct Holdings", "Indirect Holdings"])
 
 with overview_tab:
     col_left, col_right = st.columns(2, gap="large")
@@ -585,7 +704,7 @@ with overview_tab:
     st.dataframe(metrics_display, width="stretch")
     st.caption("Sources: Imperial endowment quarterly PDF disclosures, S&P 500 (FRED).")
 
-with details_tab:
+with direct_tab:
     try:
         direct_holdings = load_direct_holdings_data("data")
     except Exception as exc:  # noqa: BLE001
@@ -779,5 +898,38 @@ with details_tab:
                         height=max(320, len(collective_chart_data) * 16)
                     )
                     st.altair_chart(collective_chart, use_container_width=True)
+
+        st.caption(f"Source statement: {selected_metadata['StatementFile']}")
+
+with indirect_tab:
+    try:
+        indirect_holdings = load_indirect_holdings_data("data")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not load indirect holdings from quarterly PDFs: {exc}")
+    else:
+        statements = (
+            indirect_holdings[["StatementDate", "Statement", "StatementFile"]]
+            .drop_duplicates()
+            .sort_values("StatementDate", ascending=False)
+        )
+        selected_statement = st.selectbox(
+            "Statement",
+            statements["Statement"].tolist(),
+            index=0,
+            key="indirect_statement_selector",
+        )
+        selected_metadata = statements[statements["Statement"] == selected_statement].iloc[0]
+
+        st.subheader("Indirect Holdings")
+        selected_indirect_holdings = indirect_holdings[
+            indirect_holdings["Statement"] == selected_statement
+        ].sort_values("RowOrder")
+
+        if selected_indirect_holdings.empty:
+            st.info("No indirect holdings in companies found for the selected statement.")
+        else:
+            indirect_companies = selected_indirect_holdings["Company"].tolist()
+            indirect_table = build_two_column_company_table(indirect_companies)
+            st.table(indirect_table)
 
         st.caption(f"Source statement: {selected_metadata['StatementFile']}")
