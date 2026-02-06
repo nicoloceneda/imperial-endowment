@@ -479,7 +479,7 @@ st.markdown(
 )
 
 st.title("Imperial College Endowment")
-st.caption("Composition and performance overview.")
+st.caption("The Endowment publishes details of its Unitised Scheme investment holdings on a quarterly basis.")
 
 try:
     endowment = load_endowment_data("data")
@@ -504,7 +504,7 @@ chart_data = (
 cumulative_endowment = endowment["Total"] / endowment["Total"].iloc[0] - 1
 cumulative_sp500 = sp500 / sp500.iloc[0] - 1 if sp500 is not None else None
 
-overview_tab, details_tab = st.tabs(["Overview", "Details"])
+overview_tab, details_tab = st.tabs(["Overview", "Direct Holdings"])
 
 with overview_tab:
     col_left, col_right = st.columns(2, gap="large")
@@ -586,7 +586,6 @@ with overview_tab:
     st.caption("Sources: Imperial endowment quarterly PDF disclosures, S&P 500 (FRED).")
 
 with details_tab:
-    st.subheader("Direct Holdings")
     try:
         direct_holdings = load_direct_holdings_data("data")
     except Exception as exc:  # noqa: BLE001
@@ -602,7 +601,15 @@ with details_tab:
             statements["Statement"].tolist(),
             index=0,
         )
+        sort_option = st.radio(
+            "Sort holdings by",
+            ["Amount (High-Low)", "Name (A-Z)"],
+            index=0,
+            horizontal=True,
+        )
         selected_metadata = statements[statements["Statement"] == selected_statement].iloc[0]
+
+        st.subheader("Direct Holdings")
         selected_holdings = (
             direct_holdings[direct_holdings["Statement"] == selected_statement]
             .assign(
@@ -611,12 +618,6 @@ with details_tab:
             )
             .sort_values(by=["_cash_first", "_company_sort", "RowOrder"])
             .drop(columns=["_cash_first", "_company_sort"])
-        )
-
-        sort_option = st.radio(
-            "Sort holdings by",
-            ["Name (A-Z)", "Amount (High-Low)"],
-            horizontal=True,
         )
 
         cash_rows = selected_holdings[selected_holdings["Company"].str.strip().str.upper() == "CASH"]
@@ -637,15 +638,16 @@ with details_tab:
 
         st.table(holdings_table)
 
-        st.subheader("Capital Allocation Across Direct Holdings")
+        st.subheader("Direct Holdings - Allocation")
         holdings_chart_data = holdings_display[["Company", "Amount"]].copy()
         holdings_chart_data["IsCash"] = holdings_chart_data["Company"].str.strip().str.upper().eq("CASH")
+        holding_order = holdings_display["Company"].drop_duplicates().tolist()
         holdings_chart = (
             alt.Chart(holdings_chart_data)
             .mark_bar()
             .encode(
                 x=alt.X("Amount:Q", title="Investment Amount (£)", axis=alt.Axis(format=",.0f")),
-                y=alt.Y("Company:N", sort="-x", title="Holding"),
+                y=alt.Y("Company:N", sort=holding_order, title="Holding"),
                 color=alt.condition(alt.datum.IsCash, alt.value("#2a9d8f"), alt.value("#4e79a7")),
                 tooltip=[
                     "Company:N",
@@ -667,10 +669,31 @@ with details_tab:
         else:
             selected_collective_holdings = collective_holdings[
                 collective_holdings["Statement"] == selected_statement
-            ]
+            ].copy()
             if selected_collective_holdings.empty:
                 st.info("No collective investment vehicle details found for the selected statement.")
             else:
+                range_bounds = selected_collective_holdings["Range"].map(parse_collective_range_bounds_million)
+                selected_collective_holdings["LowerBoundM"] = range_bounds.map(
+                    lambda value: np.nan if value is None else value[0]
+                )
+                selected_collective_holdings["UpperBoundM"] = range_bounds.map(
+                    lambda value: np.nan if value is None else value[1]
+                )
+
+                if sort_option == "Name (A-Z)":
+                    selected_collective_holdings = selected_collective_holdings.sort_values(
+                        by=["Vehicle", "RowOrder"],
+                        key=lambda column: column.str.upper() if column.name == "Vehicle" else column,
+                    )
+                else:
+                    selected_collective_holdings = selected_collective_holdings.sort_values(
+                        by=["UpperBoundM", "LowerBoundM", "Vehicle"],
+                        ascending=[False, False, True],
+                        na_position="last",
+                        key=lambda column: column.str.upper() if column.name == "Vehicle" else column,
+                    )
+
                 collective_table = selected_collective_holdings[["Vehicle", "Range"]].rename(
                     columns={
                         "Range": "Investment Range",
@@ -681,27 +704,20 @@ with details_tab:
                 collective_table.index = collective_table.index + 1
                 st.table(collective_table)
 
-                st.subheader("Investment Range Across Collective Investment Vehicles")
+                st.subheader("Direct Holdings in Collective Investment Vehicles - Allocation")
                 collective_chart_data = selected_collective_holdings.copy()
-                range_bounds = collective_chart_data["Range"].map(parse_collective_range_bounds_million)
-                collective_chart_data["LowerBoundM"] = range_bounds.map(
-                    lambda value: np.nan if value is None else value[0]
-                )
-                collective_chart_data["UpperBoundM"] = range_bounds.map(
-                    lambda value: np.nan if value is None else value[1]
-                )
                 collective_chart_data = collective_chart_data.dropna(
                     subset=["LowerBoundM", "UpperBoundM"]
                 ).copy()
-                collective_chart_data["VehicleSortValue"] = collective_chart_data["UpperBoundM"]
                 collective_chart_data["RangeLabel"] = collective_chart_data["Range"]
 
                 if collective_chart_data.empty:
                     st.info("No investment range data available to display for the selected statement.")
                 else:
+                    vehicle_order = collective_chart_data["Vehicle"].drop_duplicates().tolist()
                     y_encoding = alt.Y(
                         "Vehicle:N",
-                        sort=alt.SortField("VehicleSortValue", order="descending"),
+                        sort=vehicle_order,
                         title="Collective Investment Vehicle",
                     )
                     range_line = (
