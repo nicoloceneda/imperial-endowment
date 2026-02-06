@@ -22,6 +22,22 @@ ASSET_ROW_PATTERN = re.compile(r"^\s*([A-Za-z][A-Za-z &/,\-]+?)\s+([\d,\s]+|-)\s
 DIRECT_HOLDINGS_HEADER_PATTERN = re.compile(r"^\s*Direct Holdings\s+£", flags=re.MULTILINE)
 TOTAL_FUNDS_PATTERN = re.compile(r"^\s*.*Total\s+Funds\s+[\d,\s]+$", flags=re.MULTILINE)
 HOLDING_AMOUNT_PATTERN = re.compile(r"\d[\d\s]*,\d{3}(?:,\d{3})*")
+COLLECTIVE_HOLDINGS_HEADER_PATTERN = re.compile(
+    r"^\s*Direct Holdings in Collective Investment Vehicles\s*$",
+    flags=re.MULTILINE,
+)
+TOTAL_COLLECTIVE_VEHICLES_PATTERN = re.compile(
+    r"Total\s+Collective\s+Vehicles",
+    flags=re.IGNORECASE,
+)
+DIRECT_PROPERTY_HEADER_PATTERN = re.compile(
+    r"^\s*Direct Holdings in Property\b",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+COLLECTIVE_RANGE_PATTERN = re.compile(
+    r"^\s*(<\s*£?\s*\d+(?:\.\d+)?m|£?\s*\d+(?:\.\d+)?m\s*<\s*£?\s*\d+(?:\.\d+)?m)\s*(.*)$",
+    flags=re.IGNORECASE,
+)
 NAME_FRAGMENT_TOKENS = {
     "A",
     "PLC",
@@ -200,6 +216,105 @@ def parse_direct_holdings_section(text: str, pdf_name: str) -> list[dict]:
     return records
 
 
+def normalize_collective_range(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value).strip()
+    normalized = re.sub(r"\s*<\s*", " < ", normalized)
+    normalized = normalized.replace("£ ", "£")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized.startswith("<") and not normalized.startswith("< "):
+        normalized = f"< {normalized[1:].strip()}"
+    return normalized
+
+
+def parse_collective_range_bounds_million(range_label: str) -> tuple[float, float] | None:
+    values = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", range_label)]
+    if not values:
+        return None
+
+    if range_label.strip().startswith("<"):
+        lower_bound = 0.0
+        upper_bound = values[-1]
+    elif len(values) >= 2:
+        lower_bound = values[0]
+        upper_bound = values[1]
+    else:
+        lower_bound = values[0]
+        upper_bound = values[0]
+
+    if upper_bound < lower_bound:
+        lower_bound, upper_bound = upper_bound, lower_bound
+
+    return lower_bound, upper_bound
+
+
+def parse_collective_holdings_section(text: str, pdf_name: str) -> list[dict]:
+    start_match = COLLECTIVE_HOLDINGS_HEADER_PATTERN.search(text)
+    if start_match is None:
+        raise ValueError(
+            f"{pdf_name}: could not find 'Direct Holdings in Collective Investment Vehicles' table."
+        )
+
+    section = text[start_match.end() :]
+    end_positions: list[int] = []
+    total_match = TOTAL_COLLECTIVE_VEHICLES_PATTERN.search(section)
+    if total_match is not None:
+        end_positions.append(total_match.start())
+    property_match = DIRECT_PROPERTY_HEADER_PATTERN.search(section)
+    if property_match is not None:
+        end_positions.append(property_match.start())
+    if end_positions:
+        section = section[: min(end_positions)]
+
+    ranges: list[dict] = []
+    active_range_index: int | None = None
+    pending_vehicles_text = ""
+
+    for raw_line in section.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("*"):
+            continue
+
+        range_match = COLLECTIVE_RANGE_PATTERN.match(line)
+        if range_match:
+            range_label = normalize_collective_range(range_match.group(1))
+            vehicles_text = clean_company_name(f"{pending_vehicles_text} {range_match.group(2)}")
+            ranges.append({"Range": range_label, "VehiclesText": vehicles_text})
+            active_range_index = len(ranges) - 1
+            pending_vehicles_text = ""
+            continue
+
+        if active_range_index is not None and re.search(r"[A-Za-z]", line):
+            current_text = ranges[active_range_index]["VehiclesText"]
+            ranges[active_range_index]["VehiclesText"] = clean_company_name(f"{current_text} {line}")
+            continue
+
+        if active_range_index is None and re.search(r"[A-Za-z]", line):
+            pending_vehicles_text = clean_company_name(f"{pending_vehicles_text} {line}")
+
+    if not ranges:
+        raise ValueError(
+            f"{pdf_name}: no ranges were parsed from direct holdings in collective investment vehicles."
+        )
+
+    records: list[dict] = []
+    for range_row in ranges:
+        vehicles = [
+            clean_company_name(vehicle)
+            for vehicle in range_row["VehiclesText"].split(",")
+            if clean_company_name(vehicle)
+        ]
+        for vehicle in vehicles:
+            records.append({"Range": range_row["Range"], "Vehicle": vehicle})
+
+    if not records:
+        raise ValueError(
+            f"{pdf_name}: no vehicle rows were parsed from direct holdings in collective investment vehicles."
+        )
+    return records
+
+
 @st.cache_data(show_spinner=False)
 def load_endowment_data(pdf_dir: str) -> pd.DataFrame:
     pdf_paths = sorted(Path(pdf_dir).glob("*.pdf"))
@@ -258,6 +373,44 @@ def load_direct_holdings_data(pdf_dir: str) -> pd.DataFrame:
         error_preview = "; ".join(errors[:3])
         raise RuntimeError(
             f"Failed to parse direct holdings from one or more PDFs ({len(errors)} files). {error_preview}"
+        )
+
+    return pd.DataFrame(rows).sort_values(["StatementDate", "RowOrder"])
+
+
+@st.cache_data(show_spinner=False)
+def load_collective_holdings_data(pdf_dir: str) -> pd.DataFrame:
+    pdf_paths = sorted(Path(pdf_dir).glob("*.pdf"))
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in {pdf_dir}.")
+
+    rows = []
+    errors = []
+    for pdf_path in pdf_paths:
+        try:
+            text = extract_pdf_text(str(pdf_path))
+            statement_date = parse_asset_class_section(text, pdf_path.name)["Date"]
+            statement_label = statement_date.strftime("%b-%y")
+            holdings = parse_collective_holdings_section(text, pdf_path.name)
+            for row_order, holding in enumerate(holdings, start=1):
+                rows.append(
+                    {
+                        "StatementDate": statement_date,
+                        "Statement": statement_label,
+                        "StatementFile": pdf_path.name,
+                        "RowOrder": row_order,
+                        "Range": holding["Range"],
+                        "Vehicle": holding["Vehicle"],
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{pdf_path.name}: {exc}")
+
+    if errors:
+        error_preview = "; ".join(errors[:3])
+        raise RuntimeError(
+            "Failed to parse direct holdings in collective investment vehicles "
+            f"from one or more PDFs ({len(errors)} files). {error_preview}"
         )
 
     return pd.DataFrame(rows).sort_values(["StatementDate", "RowOrder"])
@@ -502,4 +655,113 @@ with details_tab:
             .properties(height=max(320, len(holdings_chart_data) * 16))
         )
         st.altair_chart(holdings_chart, use_container_width=True)
+
+        st.subheader("Direct Holdings in Collective Investment Vehicles")
+        try:
+            collective_holdings = load_collective_holdings_data("data")
+        except Exception as exc:  # noqa: BLE001
+            st.error(
+                "Could not load direct holdings in collective investment vehicles "
+                f"from quarterly PDFs: {exc}"
+            )
+        else:
+            selected_collective_holdings = collective_holdings[
+                collective_holdings["Statement"] == selected_statement
+            ]
+            if selected_collective_holdings.empty:
+                st.info("No collective investment vehicle details found for the selected statement.")
+            else:
+                collective_table = selected_collective_holdings[["Vehicle", "Range"]].rename(
+                    columns={
+                        "Range": "Investment Range",
+                        "Vehicle": "Collective Investment Vehicle",
+                    }
+                )
+                collective_table = collective_table.reset_index(drop=True)
+                collective_table.index = collective_table.index + 1
+                st.table(collective_table)
+
+                st.subheader("Investment Range Across Collective Investment Vehicles")
+                collective_chart_data = selected_collective_holdings.copy()
+                range_bounds = collective_chart_data["Range"].map(parse_collective_range_bounds_million)
+                collective_chart_data["LowerBoundM"] = range_bounds.map(
+                    lambda value: np.nan if value is None else value[0]
+                )
+                collective_chart_data["UpperBoundM"] = range_bounds.map(
+                    lambda value: np.nan if value is None else value[1]
+                )
+                collective_chart_data = collective_chart_data.dropna(
+                    subset=["LowerBoundM", "UpperBoundM"]
+                ).copy()
+                collective_chart_data["VehicleSortValue"] = collective_chart_data["UpperBoundM"]
+                collective_chart_data["RangeLabel"] = collective_chart_data["Range"]
+
+                if collective_chart_data.empty:
+                    st.info("No investment range data available to display for the selected statement.")
+                else:
+                    y_encoding = alt.Y(
+                        "Vehicle:N",
+                        sort=alt.SortField("VehicleSortValue", order="descending"),
+                        title="Collective Investment Vehicle",
+                    )
+                    range_line = (
+                        alt.Chart(collective_chart_data)
+                        .mark_rule(color="#4e79a7", strokeWidth=2)
+                        .encode(
+                            x=alt.X(
+                                "LowerBoundM:Q",
+                                title="Investment Range (£m)",
+                                axis=alt.Axis(format=",.1f"),
+                            ),
+                            x2="UpperBoundM:Q",
+                            y=y_encoding,
+                            tooltip=[
+                                alt.Tooltip("Vehicle:N", title="Collective Investment Vehicle"),
+                                alt.Tooltip("RangeLabel:N", title="Investment Range"),
+                                alt.Tooltip("LowerBoundM:Q", title="Lower Bound (£m)", format=",.1f"),
+                                alt.Tooltip("UpperBoundM:Q", title="Upper Bound (£m)", format=",.1f"),
+                            ],
+                        )
+                    )
+                    lower_marker = (
+                        alt.Chart(collective_chart_data)
+                        .mark_point(shape="circle", filled=True, size=80, color="#d73027")
+                        .encode(
+                            x=alt.X(
+                                "LowerBoundM:Q",
+                                title="Investment Range (£m)",
+                                axis=alt.Axis(format=",.1f"),
+                            ),
+                            y=y_encoding,
+                            tooltip=[
+                                alt.Tooltip("Vehicle:N", title="Collective Investment Vehicle"),
+                                alt.Tooltip("RangeLabel:N", title="Investment Range"),
+                                alt.Tooltip("LowerBoundM:Q", title="Lower Bound (£m)", format=",.1f"),
+                                alt.Tooltip("UpperBoundM:Q", title="Upper Bound (£m)", format=",.1f"),
+                            ],
+                        )
+                    )
+                    upper_marker = (
+                        alt.Chart(collective_chart_data)
+                        .mark_point(shape="circle", filled=True, size=80, color="#1a9850")
+                        .encode(
+                            x=alt.X(
+                                "UpperBoundM:Q",
+                                title="Investment Range (£m)",
+                                axis=alt.Axis(format=",.1f"),
+                            ),
+                            y=y_encoding,
+                            tooltip=[
+                                alt.Tooltip("Vehicle:N", title="Collective Investment Vehicle"),
+                                alt.Tooltip("RangeLabel:N", title="Investment Range"),
+                                alt.Tooltip("LowerBoundM:Q", title="Lower Bound (£m)", format=",.1f"),
+                                alt.Tooltip("UpperBoundM:Q", title="Upper Bound (£m)", format=",.1f"),
+                            ],
+                        )
+                    )
+                    collective_chart = (range_line + lower_marker + upper_marker).properties(
+                        height=max(320, len(collective_chart_data) * 16)
+                    )
+                    st.altair_chart(collective_chart, use_container_width=True)
+
         st.caption(f"Source statement: {selected_metadata['StatementFile']}")
