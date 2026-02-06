@@ -619,6 +619,7 @@ composition["QuarterLabel"] = composition["Date"].dt.to_period("Q").astype(str).
 chart_data = (
     composition.groupby(["Date", "QuarterLabel", "Asset Class"], as_index=False)["Value"].sum()
 )
+chart_data["ValueMillions"] = chart_data["Value"] / 1000
 
 cumulative_endowment = endowment["Total"] / endowment["Total"].iloc[0] - 1
 cumulative_sp500 = sp500 / sp500.iloc[0] - 1 if sp500 is not None else None
@@ -639,9 +640,13 @@ with overview_tab:
                     title="Quarter",
                     sort=alt.SortField("Date", order="ascending"),
                 ),
-                y=alt.Y("Value:Q", title="Value"),
+                y=alt.Y("ValueMillions:Q", title="Value (Millions)"),
                 color=alt.Color("Asset Class:N", legend=alt.Legend(title="Asset Class")),
-                tooltip=["QuarterLabel:O", "Asset Class:N", "Value:Q"],
+                tooltip=[
+                    "QuarterLabel:O",
+                    "Asset Class:N",
+                    alt.Tooltip("ValueMillions:Q", title="Value (Millions)", format=",.0f"),
+                ],
             )
             .properties(height=320)
         )
@@ -671,7 +676,7 @@ with overview_tab:
                         values=endowment["Date"].dt.to_pydatetime().tolist(),
                     ),
                 ),
-                y=alt.Y("Return:Q", title="Cumulative return"),
+                y=alt.Y("Return:Q", title="Cumulative return (%)", axis=alt.Axis(format=".0%")),
                 color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
                 tooltip=["Date:T", "Series:N", "Return:Q"],
             )
